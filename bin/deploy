@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# deploy — pull latest, migrate, restart services.
+#
+# Usage (on the server):
+#   ./bin/deploy
+#   ./bin/deploy --skip-migrate   (if no new migrations)
+#
+# This is the full deploy sequence for a single-server managed service setup.
+# For each customer on their own server, run this from the project directory.
+
+set -euo pipefail
+
+SKIP_MIGRATE=${1:-""}
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+cd "$PROJECT_DIR"
+
+echo "[deploy] Starting deploy at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+echo "[deploy] Project: $PROJECT_DIR"
+
+# 1. Pull latest image or rebuild
+echo "[deploy] Building images..."
+docker compose build --pull
+
+# 2. Run migrations (before restarting API — zero downtime migration pattern)
+if [ "$SKIP_MIGRATE" != "--skip-migrate" ]; then
+    echo "[deploy] Running migrations..."
+    docker compose run --rm migrate
+    echo "[deploy] Migrations done."
+else
+    echo "[deploy] Skipping migrations (--skip-migrate passed)."
+fi
+
+# 3. Restart API with zero-downtime rolling restart
+echo "[deploy] Restarting API..."
+docker compose up -d --no-deps api
+
+# 4. Restart worker(s)
+echo "[deploy] Restarting worker(s)..."
+docker compose up -d --no-deps worker
+
+# 5. Health check
+echo "[deploy] Waiting for API health check..."
+MAX_WAIT=30
+WAITED=0
+until curl -sf http://localhost:8000/health > /dev/null 2>&1; do
+    sleep 2
+    WAITED=$((WAITED + 2))
+    if [ $WAITED -ge $MAX_WAIT ]; then
+        echo "[deploy] ERROR: API did not become healthy after ${MAX_WAIT}s. Check logs:"
+        echo "  docker compose logs --tail=50 api"
+        exit 1
+    fi
+done
+
+echo "[deploy] API is healthy."
+echo "[deploy] Deploy complete at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+echo ""
+echo "To verify:"
+echo "  docker compose ps"
+echo "  docker compose logs --tail=20 api"

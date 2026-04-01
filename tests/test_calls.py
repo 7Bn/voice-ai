@@ -3,10 +3,15 @@ Tests for the Twilio inbound call webhook (app/routers/calls.py).
 
 Coverage:
   POST /twilio/voice
-    ├── [✓] practice found + active → TwiML connects call
+    ├── [✓] practice found + SIP configured → TwiML with <Sip> URI
+    ├── [✓] practice found + SIP configured → X- headers include practice_id
+    ├── [✓] practice found + SIP NOT configured → holding message + hangup
     ├── [✓] practice not found → graceful hangup TwiML
     ├── [✓] practice found but is_active=False → graceful hangup (lapsed subscription)
     └── [✓] health check → 200 OK
+
+  POST /twilio/status
+    └── [✓] returns {"status": "received"}
 
   Helper: _twiml_hangup
     └── [✓] returns XML with <Say> and <Hangup>
@@ -33,19 +38,47 @@ class TestInboundCall:
         assert resp.status_code == 200
         assert resp.json() == {"status": "ok"}
 
+    @patch("app.routers.calls.settings")
     @patch("app.routers.calls.Practice.get_by_twilio_number", new_callable=AsyncMock)
-    def test_practice_found_returns_twiml(self, mock_get):
+    def test_sip_configured_returns_sip_twiml(self, mock_get, mock_settings):
         mock_get.return_value = make_practice(name="Sunrise Dental")
+        mock_settings.livekit_sip_host = "abc123.sip.livekit.cloud"
 
         resp = client.post("/twilio/voice", data=_twilio_form(to="+15551234567"))
 
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "application/xml"
         body = resp.text
-        assert "<?xml" in body
-        assert "Sunrise Dental" in body
-        # Should NOT hang up — call is connecting
+        assert "sip:" in body
+        assert "abc123.sip.livekit.cloud" in body
         assert "<Hangup" not in body
+
+    @patch("app.routers.calls.settings")
+    @patch("app.routers.calls.Practice.get_by_twilio_number", new_callable=AsyncMock)
+    def test_sip_twiml_includes_practice_headers(self, mock_get, mock_settings):
+        practice = make_practice(name="Sunrise Dental")
+        mock_get.return_value = practice
+        mock_settings.livekit_sip_host = "abc123.sip.livekit.cloud"
+
+        resp = client.post("/twilio/voice", data=_twilio_form(to="+15551234567"))
+
+        body = resp.text
+        # Practice ID should be in the TwiML as an X- SIP header value
+        assert str(practice.id) in body
+        assert "X-Practice-Id" in body
+
+    @patch("app.routers.calls.settings")
+    @patch("app.routers.calls.Practice.get_by_twilio_number", new_callable=AsyncMock)
+    def test_sip_not_configured_returns_holding_message(self, mock_get, mock_settings):
+        mock_get.return_value = make_practice(name="Sunrise Dental")
+        mock_settings.livekit_sip_host = ""  # not yet configured
+
+        resp = client.post("/twilio/voice", data=_twilio_form(to="+15551234567"))
+
+        assert resp.status_code == 200
+        body = resp.text
+        assert "<Hangup" in body
+        assert "sip:" not in body
 
     @patch("app.routers.calls.Practice.get_by_twilio_number", new_callable=AsyncMock)
     def test_practice_not_found_hangs_up(self, mock_get):
@@ -55,15 +88,13 @@ class TestInboundCall:
 
         assert resp.status_code == 200
         body = resp.text
-        assert "<?xml" in body
         assert "<Hangup" in body
         assert "not in service" in body
 
     @patch("app.routers.calls.Practice.get_by_twilio_number", new_callable=AsyncMock)
     def test_inactive_practice_is_rejected(self, mock_get):
-        """get_by_twilio_number filters is_active=True at the DB level.
-        If practice is inactive, the query returns None."""
-        mock_get.return_value = None  # DB returns None for inactive practices
+        """get_by_twilio_number filters is_active=True at the DB level."""
+        mock_get.return_value = None
 
         resp = client.post("/twilio/voice", data=_twilio_form(to="+15557777777"))
 

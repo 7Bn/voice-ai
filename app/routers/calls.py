@@ -21,7 +21,6 @@ Run `python -m app.livekit_setup setup` once per deployment to create the
 SIP trunk and dispatch rule. Then set LIVEKIT_SIP_HOST in .env.
 """
 
-import json
 import urllib.parse
 
 from fastapi import APIRouter, Depends, Form, Request
@@ -92,7 +91,7 @@ async def inbound_call(
     # because it may contain characters invalid in SIP URIs.
     sip_headers = {
         "X-Practice-Id":       str(practice.id),
-        "X-Practice-Name":     practice.name,
+        "X-Practice-Name":     practice.name[:40],  # truncate to stay under 1024 char SIP limit
         "X-Practice-State":    practice.state,
         "X-Practice-Timezone": practice.timezone,
         "X-Escalation-Number": practice.escalation_number,
@@ -102,7 +101,6 @@ async def inbound_call(
         "X-Stt-Provider":      practice.stt_provider,
         "X-Tts-Provider":      practice.tts_provider,
         "X-Ehr-Adapter":       config.ehr_adapter,
-        "X-Practice-Config":   json.dumps(config.model_dump()),
     }
 
     # Encode headers into the SIP URI query string
@@ -120,12 +118,14 @@ async def call_status(
     CallSid: str = Form(...),
     CallStatus: str = Form(...),
     db: AsyncSession = Depends(get_db),
-) -> dict:
+) -> Response:
     """
     Twilio calls this when a call ends or changes status.
     Logs the event — the agent handles final DB writes via /internal/finalize_call.
+    Must return TwiML XML (even if empty) — Twilio requires Content-Type: application/xml.
     """
     import logging
     logger = logging.getLogger(__name__)
     logger.info(f"Call status update: {CallSid} → {CallStatus}")
-    return {"status": "received"}
+    vr = VoiceResponse()
+    return Response(content=str(vr), media_type="application/xml")

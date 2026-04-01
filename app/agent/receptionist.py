@@ -16,12 +16,12 @@ Call end:
   Agent calls finalize_call() → writes transcript to PostgreSQL + audio to S3
 """
 
+import asyncio
 import logging
 import os
 
-from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli, llm
-from livekit.agents.voice_assistant import VoiceAssistant
-from livekit.plugins import anthropic, deepgram, elevenlabs, openai, silero
+from livekit.agents import Agent, AgentSession, AutoSubscribe, JobContext, WorkerOptions, cli
+from livekit.plugins import anthropic, deepgram, elevenlabs, silero
 
 from app.agent.disclosures import get_disclosure
 from app.agent.prompts import build_system_prompt
@@ -94,27 +94,6 @@ async def entrypoint(ctx: JobContext) -> None:
     )
     conv.booking.patient_phone = patient_phone
 
-    # After-hours check — if outside business hours, deliver message and hang up
-    if config.after_hours_message and not config.business_hours.is_open_now(practice_timezone):
-        logger.info(f"After-hours call for practice {practice_id} — delivering message")
-        assistant_ah = VoiceAssistant(
-            vad=silero.VAD.load(),
-            stt=deepgram.STT(model="nova-2", language="en-US",
-                             api_key=os.environ.get("DEEPGRAM_API_KEY", "")),
-            llm=anthropic.LLM(model=config.llm_model,
-                               api_key=os.environ.get("ANTHROPIC_API_KEY", "")),
-            tts=_build_tts(tts_provider, config),
-        )
-        assistant_ah.start(ctx.room)
-        await assistant_ah.say(config.after_hours_message, allow_interruptions=False)
-        return
-
-    # Build initial system prompt for GREETING state (parameterized by PracticeConfig)
-    initial_chat_ctx = llm.ChatContext().append(
-        role="system",
-        text=build_system_prompt(practice_name, practice_state, ConversationState.GREETING, config),
-    )
-
     # STT: provider selected from practice config
     stt = _build_stt(stt_provider)
 
@@ -127,65 +106,84 @@ async def entrypoint(ctx: JobContext) -> None:
     # TTS: provider + voice selected from practice config
     tts = _build_tts(tts_provider, config)
 
-    # VAD: Silero for end-of-speech detection
-    vad = silero.VAD.load()
+    # System prompt for GREETING state
+    system_prompt = build_system_prompt(
+        practice_name, practice_state, ConversationState.GREETING, config
+    )
 
-    assistant = VoiceAssistant(
-        vad=vad,
+    # Create AgentSession (STT → LLM → TTS pipeline)
+    session = AgentSession(
         stt=stt,
         llm=lm,
         tts=tts,
-        chat_ctx=initial_chat_ctx,
+        vad=silero.VAD.load(),
     )
 
-    assistant.start(ctx.room)
+    # After-hours check — if outside business hours, deliver message and hang up
+    if config.after_hours_message and not config.business_hours.is_open_now(practice_timezone):
+        logger.info(f"After-hours call for practice {practice_id} — delivering message")
+        await session.start(room=ctx.room, agent=Agent(instructions="You are a voice assistant."))
+        await session.generate_reply(
+            instructions=f"Say exactly the following message, word for word: {config.after_hours_message}"
+        )
+        return
 
-    # Deliver HIPAA disclosure as the very first utterance (verbatim, not via LLM)
+    # Track conversation turns via conversation_item_added event
+    @session.on("conversation_item_added")
+    def on_conversation_item_added(event) -> None:
+        item = event.item
+        if item.role == "user":
+            text = item.text_content or ""
+            conv.append_transcript("PATIENT", text)
+
+            # Check escalation keywords
+            keyword = conv.check_for_escalation_keyword(text)
+            if keyword:
+                logger.info(f"Escalation keyword detected: '{keyword}' — triggering transfer")
+                conv.escalation_reason = f"keyword: {keyword}"
+                conv.transition(ConversationState.ESCALATING)
+                asyncio.create_task(_trigger_escalation(conv, session))
+
+            # Check 4-minute timeout
+            if conv.should_escalate_due_to_timeout():
+                logger.info("Call timeout — triggering escalation")
+                conv.escalation_reason = "timeout: 4 minutes without resolution"
+                conv.transition(ConversationState.ESCALATING)
+                asyncio.create_task(_trigger_escalation(conv, session))
+
+        elif item.role == "assistant":
+            conv.append_transcript("AGENT", item.text_content or "")
+
+    # Wait for session close
+    close_future: asyncio.Future = asyncio.get_event_loop().create_future()
+
+    @session.on("close")
+    def on_close(_) -> None:
+        if not close_future.done():
+            close_future.set_result(None)
+
+    # Start the agent
+    await session.start(room=ctx.room, agent=Agent(instructions=system_prompt))
+
+    # Deliver HIPAA disclosure as the very first utterance
     disclosure = get_disclosure(practice_state, sms_enabled=config.sms_enabled)
     greeting = (
         f"Thank you for calling {practice_name}. {disclosure} "
         f"My name is {config.agent_name}. How can I help you today?"
     )
-    await assistant.say(greeting, allow_interruptions=True)
-    conv.append_transcript("AGENT", greeting)
+    await session.generate_reply(
+        instructions=f"Say exactly the following greeting, word for word: {greeting}"
+    )
     conv.transition(ConversationState.IDENTIFY_PATIENT)
 
-    # Register hooks for monitoring conversation turns
-    @assistant.on("user_speech_committed")
-    def on_user_speech(msg: llm.ChatMessage) -> None:
-        text = msg.content or ""
-        conv.append_transcript("PATIENT", text)
-
-        # Check escalation keywords
-        keyword = conv.check_for_escalation_keyword(text)
-        if keyword:
-            logger.info(f"Escalation keyword detected: '{keyword}' — triggering transfer")
-            conv.escalation_reason = f"keyword: {keyword}"
-            conv.transition(ConversationState.ESCALATING)
-            # Schedule escalation — runs outside this sync callback
-            import asyncio
-            asyncio.create_task(_trigger_escalation(conv, assistant))
-
-        # Check 4-minute timeout
-        if conv.should_escalate_due_to_timeout():
-            logger.info("Call timeout — triggering escalation")
-            conv.escalation_reason = "timeout: 4 minutes without resolution"
-            conv.transition(ConversationState.ESCALATING)
-            import asyncio
-            asyncio.create_task(_trigger_escalation(conv, assistant))
-
-    @assistant.on("agent_speech_committed")
-    def on_agent_speech(msg: llm.ChatMessage) -> None:
-        conv.append_transcript("AGENT", msg.content or "")
-
     # Wait for the call to end
-    await assistant.run()
+    await close_future
 
-    # Call ended — finalize (write to DB + S3)
+    # Call ended — finalize (write to DB + blob storage)
     await _finalize_call(conv)
 
 
-async def _trigger_escalation(conv: ConversationContext, assistant: VoiceAssistant) -> None:
+async def _trigger_escalation(conv: ConversationContext, session: AgentSession) -> None:
     """
     Signal FastAPI to initiate a Twilio warm transfer with whisper leg.
     The actual transfer is handled by POST /internal/escalate.
@@ -212,8 +210,8 @@ async def _trigger_escalation(conv: ConversationContext, assistant: VoiceAssista
         logger.error(f"Failed to trigger escalation: {e}")
 
     # Tell the patient we're connecting them
-    await assistant.say(
-        "Let me connect you with our team right now. Please hold for just a moment.",
+    await session.generate_reply(
+        instructions="Say exactly: Let me connect you with our team right now. Please hold for just a moment.",
         allow_interruptions=False,
     )
     conv.transition(ConversationState.TRANSFERRED)

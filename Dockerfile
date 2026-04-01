@@ -8,7 +8,7 @@
 #   api:    uvicorn app.main:app
 #   worker: python -m app.agent.receptionist
 
-FROM python:3.11-slim AS builder
+FROM mcr.microsoft.com/mirror/docker/library/python:3.11-slim AS builder
 
 WORKDIR /build
 
@@ -29,7 +29,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # ---------------------------------------------------------------------------
 
-FROM python:3.11-slim AS runtime
+FROM mcr.microsoft.com/mirror/docker/library/python:3.11-slim AS runtime
 
 WORKDIR /app
 

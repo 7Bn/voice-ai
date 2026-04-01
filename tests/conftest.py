@@ -23,6 +23,7 @@ async def async_client() -> AsyncGenerator[AsyncClient, None]:
 def make_practice(**kwargs):
     """Build a mock Practice object for tests."""
     from unittest.mock import MagicMock
+    from app.models.practice_config import PracticeConfig
     p = MagicMock()
     p.id = kwargs.get("id", uuid.uuid4())
     p.name = kwargs.get("name", "Sunrise Dental")
@@ -33,4 +34,5 @@ def make_practice(**kwargs):
     p.is_active = kwargs.get("is_active", True)
     p.stt_provider = kwargs.get("stt_provider", "deepgram")
     p.tts_provider = kwargs.get("tts_provider", "elevenlabs")
+    p.get_config.return_value = kwargs.get("config", PracticeConfig())
     return p

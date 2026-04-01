@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.ruff_cache
+.git
+.gitignore
+*.md
+!alembic.ini
+.claude
+TODOS.md

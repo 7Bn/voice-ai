@@ -34,29 +34,51 @@ async def entrypoint(ctx: JobContext) -> None:
     """
     LiveKit calls this for every new agent job (one per inbound call).
 
-    ctx.job.metadata contains the practice config, serialized as JSON by the
-    Twilio webhook handler when it creates the LiveKit room.
+    Practice metadata arrives via SIP X- headers that Twilio sends when it
+    connects the call. LiveKit's SIP trunk maps those headers to job attributes
+    (configured in livekit_setup.py via headers_to_attributes).
+
+    Fallback: if running without LiveKit SIP (e.g. local dev / testing),
+    ctx.job.metadata is parsed as JSON as a compatibility path.
     """
     import json
 
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
-    # Parse practice metadata injected by the Twilio webhook
-    metadata = json.loads(ctx.job.metadata or "{}")
-    practice_id = metadata.get("practice_id", "unknown")
-    practice_name = metadata.get("practice_name", "the practice")
-    practice_state = metadata.get("practice_state", "NY")
-    practice_timezone = metadata.get("practice_timezone", "America/New_York")
-    call_sid = metadata.get("call_sid", "unknown")
-    patient_phone = metadata.get("patient_phone", "unknown")
-    escalation_number = metadata.get("escalation_number", "")
-    staff_email = metadata.get("staff_email")
-    stt_provider = metadata.get("stt_provider", "deepgram")
-    tts_provider = metadata.get("tts_provider", "elevenlabs")
+    # Primary: read from LiveKit SIP attributes (set by X- headers from Twilio TwiML)
+    attrs = getattr(ctx.job, "attributes", {}) or {}
+
+    # Fallback: parse ctx.job.metadata as JSON (local dev / non-SIP testing)
+    metadata: dict = {}
+    if not attrs and ctx.job.metadata:
+        try:
+            metadata = json.loads(ctx.job.metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+
+    def _get(key: str, default: str = "") -> str:
+        return attrs.get(key) or metadata.get(key) or default
+
+    practice_id       = _get("practice_id", "unknown")
+    practice_name     = _get("practice_name", "the practice")
+    practice_state    = _get("practice_state", "NY")
+    practice_timezone = _get("practice_timezone", "America/New_York")
+    call_sid          = _get("call_sid", "unknown")
+    patient_phone     = _get("patient_phone", "unknown")
+    escalation_number = _get("escalation_number", "")
+    staff_email       = attrs.get("staff_email") or metadata.get("staff_email")
+    stt_provider      = _get("stt_provider", "deepgram")
+    tts_provider      = _get("tts_provider", "elevenlabs")
 
     # Deserialize per-practice config (agent name, services, EHR adapter, voice, etc.)
     from app.models.practice_config import PracticeConfig
-    config = PracticeConfig.from_dict(metadata.get("config"))
+    config_raw = attrs.get("config") or metadata.get("config")
+    if isinstance(config_raw, str):
+        try:
+            config_raw = json.loads(config_raw)
+        except (json.JSONDecodeError, TypeError):
+            config_raw = None
+    config = PracticeConfig.from_dict(config_raw)
 
     # Initialize conversation context (in-memory for this call)
     conv = ConversationContext(

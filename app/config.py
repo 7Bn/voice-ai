@@ -17,10 +17,8 @@ class Settings(BaseSettings):
     livekit_api_secret: str = ""
     livekit_sip_host: str = ""       # e.g. abc123.sip.livekit.cloud — from livekit_setup.py
     livekit_sip_trunk_id: str = ""   # set after running livekit_setup.py
-    aws_access_key_id: str = ""
-    aws_secret_access_key: str = ""
-    aws_region: str = "us-east-1"
-    s3_bucket: str = ""
+    azure_storage_connection_string: str = ""  # from Azure portal → Storage account → Access keys
+    azure_storage_container: str = "voice-ai-calls"  # container name in your storage account
     environment: str = "development"
     secret_key: str = "change-me-in-production"
     # Outbound notifications (NotifyAdapter)

@@ -46,44 +46,64 @@ async def entrypoint(ctx: JobContext) -> None:
     practice_id = metadata.get("practice_id", "unknown")
     practice_name = metadata.get("practice_name", "the practice")
     practice_state = metadata.get("practice_state", "NY")
+    practice_timezone = metadata.get("practice_timezone", "America/New_York")
     call_sid = metadata.get("call_sid", "unknown")
     patient_phone = metadata.get("patient_phone", "unknown")
+    escalation_number = metadata.get("escalation_number", "")
+    staff_email = metadata.get("staff_email")
+    stt_provider = metadata.get("stt_provider", "deepgram")
+    tts_provider = metadata.get("tts_provider", "elevenlabs")
+
+    # Deserialize per-practice config (agent name, services, EHR adapter, voice, etc.)
+    from app.models.practice_config import PracticeConfig
+    config = PracticeConfig.from_dict(metadata.get("config"))
 
     # Initialize conversation context (in-memory for this call)
     conv = ConversationContext(
         practice_id=practice_id,
         practice_name=practice_name,
         practice_state=practice_state,
+        practice_timezone=practice_timezone,
         call_sid=call_sid,
         patient_phone=patient_phone,
+        escalation_number=escalation_number,
+        staff_email=staff_email,
+        ehr_adapter=config.ehr_adapter,
     )
     conv.booking.patient_phone = patient_phone
 
-    # Build initial system prompt for GREETING state
+    # After-hours check — if outside business hours, deliver message and hang up
+    if config.after_hours_message and not config.business_hours.is_open_now(practice_timezone):
+        logger.info(f"After-hours call for practice {practice_id} — delivering message")
+        assistant_ah = VoiceAssistant(
+            vad=silero.VAD.load(),
+            stt=deepgram.STT(model="nova-2", language="en-US",
+                             api_key=os.environ.get("DEEPGRAM_API_KEY", "")),
+            llm=anthropic.LLM(model=config.llm_model,
+                               api_key=os.environ.get("ANTHROPIC_API_KEY", "")),
+            tts=_build_tts(tts_provider, config),
+        )
+        assistant_ah.start(ctx.room)
+        await assistant_ah.say(config.after_hours_message, allow_interruptions=False)
+        return
+
+    # Build initial system prompt for GREETING state (parameterized by PracticeConfig)
     initial_chat_ctx = llm.ChatContext().append(
         role="system",
-        text=build_system_prompt(practice_name, practice_state, ConversationState.GREETING),
+        text=build_system_prompt(practice_name, practice_state, ConversationState.GREETING, config),
     )
 
-    # STT: Deepgram streaming (provider abstraction — swap to Sarvam here later)
-    stt = deepgram.STT(
-        model="nova-2",
-        language="en-US",
-        api_key=os.environ.get("DEEPGRAM_API_KEY", ""),
-    )
+    # STT: provider selected from practice config
+    stt = _build_stt(stt_provider)
 
-    # LLM: Claude (BAA signed with Anthropic)
+    # LLM: Claude (BAA signed with Anthropic) — model from practice config
     lm = anthropic.LLM(
-        model="claude-sonnet-4-6",
+        model=config.llm_model,
         api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
     )
 
-    # TTS: ElevenLabs (BAA confirmed)
-    tts = elevenlabs.TTS(
-        api_key=os.environ.get("ELEVENLABS_API_KEY", ""),
-        voice_id="21m00Tcm4TlvDq8ikWAM",  # Rachel — warm, professional
-        model_id="eleven_turbo_v2",  # low-latency model
-    )
+    # TTS: provider + voice selected from practice config
+    tts = _build_tts(tts_provider, config)
 
     # VAD: Silero for end-of-speech detection
     vad = silero.VAD.load()
@@ -99,10 +119,10 @@ async def entrypoint(ctx: JobContext) -> None:
     assistant.start(ctx.room)
 
     # Deliver HIPAA disclosure as the very first utterance (verbatim, not via LLM)
-    disclosure = get_disclosure(practice_state)
+    disclosure = get_disclosure(practice_state, sms_enabled=config.sms_enabled)
     greeting = (
         f"Thank you for calling {practice_name}. {disclosure} "
-        f"My name is Aria. How can I help you today?"
+        f"My name is {config.agent_name}. How can I help you today?"
     )
     await assistant.say(greeting, allow_interruptions=True)
     conv.append_transcript("AGENT", greeting)
@@ -204,12 +224,18 @@ async def _finalize_call(conv: ConversationContext, twilio_recording_url: str | 
     payload = {
         "call_sid": conv.call_sid,
         "practice_id": conv.practice_id,
+        "practice_name": conv.practice_name,
+        "practice_timezone": conv.practice_timezone,
+        "escalation_number": conv.escalation_number,
+        "staff_email": conv.staff_email,
+        "ehr_adapter": conv.ehr_adapter,
         "patient_phone": conv.patient_phone,
         "started_at": conv.started_at.isoformat(),
         "disposition": _disposition(conv),
         "patient_name": conv.booking.patient_name,
         "requested_time": conv.booking.requested_time,
         "service_type": conv.booking.service_type,
+        "notes": conv.booking.notes,
         "transcript": conv.full_transcript(),
         "twilio_recording_url": twilio_recording_url,
     }
@@ -245,6 +271,37 @@ def _disposition(conv: ConversationContext) -> str:
             return "BOOKING_CAPTURED"
         return "FAQ_ONLY"
     return "HUNG_UP"
+
+
+def _build_stt(stt_provider: str):
+    """Return the STT plugin for the given provider name."""
+    if stt_provider == "sarvam":
+        # Sarvam-AI STT — multilingual (Hindi, Tamil, Telugu, etc.)
+        # Swap in when practice serves non-English speaking patients
+        # from livekit.plugins import sarvam  # TODO: add when sarvam plugin ships
+        logger.warning("Sarvam STT not yet available — falling back to Deepgram")
+
+    # Default: Deepgram nova-2 (English, low-latency, HIPAA BAA signed)
+    return deepgram.STT(
+        model="nova-2",
+        language="en-US",
+        api_key=os.environ.get("DEEPGRAM_API_KEY", ""),
+    )
+
+
+def _build_tts(tts_provider: str, config):
+    """Return the TTS plugin for the given provider name and practice config."""
+    if tts_provider == "cartesia":
+        # Cartesia — alternative TTS with different voice options
+        # from livekit.plugins import cartesia  # TODO: wire up when needed
+        logger.warning("Cartesia TTS not yet wired — falling back to ElevenLabs")
+
+    # Default: ElevenLabs (BAA confirmed, low-latency turbo model)
+    return elevenlabs.TTS(
+        api_key=os.environ.get("ELEVENLABS_API_KEY", ""),
+        voice_id=config.tts_voice_id,
+        model_id="eleven_turbo_v2",
+    )
 
 
 if __name__ == "__main__":

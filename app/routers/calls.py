@@ -44,16 +44,33 @@ async def inbound_call(
     if practice is None:
         return _twiml_hangup("This number is not in service. Goodbye.")
 
-    # Practice found — connect to LiveKit agent via SIP
-    # LiveKit SIP endpoint is configured per-practice in practice config (future)
-    # For now: return a placeholder TwiML that says the AI is connecting
-    # TODO(v0.2): replace with real LiveKit SIP connect TwiML
+    # Practice found — connect to LiveKit agent via SIP.
+    # We serialize the full practice config into the TwiML <Parameter> block so the
+    # LiveKit agent job receives everything it needs without a DB round-trip.
+    import json
+
+    config = practice.get_config()
+    metadata = json.dumps({
+        "practice_id": str(practice.id),
+        "practice_name": practice.name,
+        "practice_state": practice.state,
+        "practice_timezone": practice.timezone,
+        "escalation_number": practice.escalation_number,
+        "staff_email": practice.staff_email,
+        "call_sid": CallSid,
+        "patient_phone": From,
+        "stt_provider": practice.stt_provider,
+        "tts_provider": practice.tts_provider,
+        "config": config.model_dump(),
+    })
+
+    # TODO(v0.2): replace with real LiveKit SIP connect TwiML + metadata parameter
     vr = VoiceResponse()
     vr.say(
         f"Thank you for calling {practice.name}. "
         "Please hold while our AI assistant connects."
     )
-    # TODO: vr.connect() → LiveKit SIP trunk
+    # TODO: vr.connect() → LiveKit SIP trunk with metadata=metadata
     return Response(content=str(vr), media_type="application/xml")
 
 

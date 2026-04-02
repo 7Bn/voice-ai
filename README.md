@@ -12,30 +12,32 @@ Built on Twilio Media Streams + Deepgram STT + Claude + ElevenLabs TTS, deployed
 
 ```mermaid
 graph TB
-    Patient([Patient Phone]) -->|PSTN call| Twilio
-    Twilio -->|POST /twilio/voice| API
-    API -->|TwiML: Connect+Stream| Twilio
-    Twilio <-->|WebSocket\nμ-law 8kHz audio| API
 
-    subgraph Azure App Service
-        API[FastAPI\napp/routers/stream.py]
-    end
+Patient([Patient Phone]) -->|PSTN call| Twilio
+Twilio -->|POST /twilio/voice| API
+API -->|TwiML: Connect + Stream| Twilio
+Twilio <-->|WebSocket μ-law 8kHz audio| API
 
-    subgraph AI Pipeline per call
-        API -->|audio chunks| Deepgram[Deepgram\nSTT nova-2]
-        Deepgram -->|transcript| Claude[Anthropic Claude\nclaude-sonnet-4-6]
-        Claude -->|reply text| ElevenLabs[ElevenLabs TTS\nulaw_8000]
-        ElevenLabs -->|audio chunks| API
-    end
+subgraph Azure App Service
+    API[FastAPI<br/>app/routers/stream.py]
+end
 
-    API -->|finalize_call| DB[(PostgreSQL)]
-    API -->|transcript| Blob[(Azure Blob\nStorage)]
-    API -->|booking / escalation| SendGrid[SendGrid\nEmail + SMS]
+subgraph AI Pipeline per Call
+    API -->|audio chunks| Deepgram[Deepgram<br/>STT nova-2]
+    Deepgram -->|transcript| Claude[Anthropic Claude<br/>claude-sonnet-4-6]
+    Claude -->|reply text| ElevenLabs[ElevenLabs TTS<br/>ulaw_8000]
+    ElevenLabs -->|audio chunks| API
+end
 
-    subgraph Azure Container Registry
-        ACR[voice-ai image]
-    end
-    ACR -->|deployed to| API
+API -->|finalize_call| DB[(PostgreSQL)]
+API -->|transcript| Blob[(Azure Blob Storage)]
+API -->|booking / escalation| SendGrid[SendGrid<br/>Email + SMS]
+
+subgraph Azure Container Registry
+    ACR[voice-ai image]
+end
+
+ACR -->|deployed to| API
 ```
 
 ### Call flow (per call)

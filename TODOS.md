@@ -9,6 +9,13 @@ Last updated: 2026-04-02
 - [ ] B3/B6: Sign ElevenLabs HIPAA BAA (available on paid plans). Required before any patient audio flows through TTS.
 - [ ] B1: PMS integration v0.1 scope is "fake it" (capture intent → SMS/email to practice). Confirm first paying client is OK with manual PMS confirmation by staff. Document explicitly in pilot terms.
 
+## Security (P1 — fix before real patient traffic)
+
+- [ ] P1/SEC-1: Add Twilio request signature verification to `/twilio/voice` and `/twilio/status`. Use `twilio.request_validator.RequestValidator` — any internet client can currently POST fake calls, burning Deepgram/Claude/ElevenLabs API quota and injecting fabricated call records.
+- [ ] P1/SEC-2: Gate `/internal/*` endpoints so they're not publicly routable. Option A: IP allowlist in Azure App Service (allow only `127.0.0.1`). Option B: shared secret header. Option C: call internal business logic directly (skip HTTP). Comment in `internal.py:11` already flags this.
+- [ ] P1/SEC-3: Protect against concurrent Deepgram transcript race condition in `stream.py:_on_final_transcript`. Two rapid utterances can interleave `user → user` messages in Claude history (invalid sequence → 400). Add a per-call asyncio.Lock before appending to `self.messages`.
+- [ ] P1/SEC-4: Guard Claude message history on API error in `stream.py:_respond`. Currently `self.messages.append({"role":"user",...})` happens before `_claude_respond`. If Claude throws, the user message is in history with no assistant reply → next turn sends consecutive `user` messages → 400. Fix: only append user message after a successful response, or rollback on error.
+
 ## Architecture decisions
 
 - [x] Choose database: PostgreSQL + asyncpg + SQLAlchemy async. **Done — schema live, migrations running.**

@@ -32,7 +32,7 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
-async def create_sip_trunk_and_dispatch_rule(dry_run: bool = False) -> dict:
+async def create_sip_trunk_and_dispatch_rule(dry_run: bool = False, existing_trunk_id: str | None = None) -> dict:
     """
     Create the LiveKit inbound SIP trunk and dispatch rule.
 
@@ -74,30 +74,33 @@ async def create_sip_trunk_and_dispatch_rule(dry_run: bool = False) -> dict:
     )
 
     try:
-        # Step 1: Create inbound SIP trunk
-        trunk_info = SIPInboundTrunkInfo(
-            name="Voice AI Receptionist — Twilio Inbound",
-        )
+        # Step 1: Create inbound SIP trunk (skip if existing_trunk_id provided)
+        if existing_trunk_id:
+            trunk_id = existing_trunk_id
+            click.echo(f"\n[OK] Reusing existing SIP trunk: {trunk_id}")
+        else:
+            trunk_info = SIPInboundTrunkInfo(
+                name="Voice AI Receptionist — Twilio Inbound",
+            )
 
-        # Allow calls from any address — Twilio uses a large, changing IP range.
-        # In production, scope to Twilio's published SIP IP ranges for defense-in-depth.
-        trunk_info.allowed_addresses.append("0.0.0.0/0")
+            # Allow calls from any address — Twilio uses a large, changing IP range.
+            # In production, scope to Twilio's published SIP IP ranges for defense-in-depth.
+            trunk_info.allowed_addresses.append("0.0.0.0/0")
 
-        # Map SIP X- headers (sent by our TwiML) to LiveKit attributes.
-        # These become available to the agent as ctx.job.metadata (JSON).
-        for header, attribute in _HEADER_ATTRIBUTE_MAP.items():
-            trunk_info.headers_to_attributes[header] = attribute
+            # Map SIP X- headers (sent by our TwiML) to LiveKit attributes.
+            # These become available to the agent as ctx.job.metadata (JSON).
+            for header, attribute in _HEADER_ATTRIBUTE_MAP.items():
+                trunk_info.headers_to_attributes[header] = attribute
 
-        trunk_req = CreateSIPInboundTrunkRequest(trunk=trunk_info)
-        trunk = await lkapi.sip.create_inbound_trunk(trunk_req)
-        trunk_id = trunk.sip_trunk_id
+            trunk_req = CreateSIPInboundTrunkRequest(trunk=trunk_info)
+            trunk = await lkapi.sip.create_inbound_trunk(trunk_req)
+            trunk_id = trunk.sip_trunk_id
 
-        click.echo(f"\n[OK] SIP trunk created: {trunk_id}")
+            click.echo(f"\n[OK] SIP trunk created: {trunk_id}")
 
         # Step 2: Create dispatch rule — one room per call
         individual_rule = SIPDispatchRuleIndividual(
             room_prefix="call_",
-            no_randomness=False,  # room names: call_<random> — unique per patient call
         )
 
         dispatch_rule = SIPDispatchRule()
@@ -181,10 +184,11 @@ def cli():
 
 @cli.command("setup")
 @click.option("--dry-run", is_flag=True)
-def setup(dry_run):
+@click.option("--trunk-id", default=None, help="Reuse existing trunk ID, skip trunk creation.")
+def setup(dry_run, trunk_id):
     """Create LiveKit SIP trunk and dispatch rule."""
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(create_sip_trunk_and_dispatch_rule(dry_run=dry_run))
+    asyncio.run(create_sip_trunk_and_dispatch_rule(dry_run=dry_run, existing_trunk_id=trunk_id))
 
 
 @cli.command("list")
